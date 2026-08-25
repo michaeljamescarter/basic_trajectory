@@ -1,0 +1,481 @@
+### PCA and DGE analysis--------------------------------------------------
+
+### Bioconductor and CRAN libraries used
+library(tidyverse)
+library(RColorBrewer)
+library(DESeq2)
+library(DEGreport)
+library(ggplot2)
+library(tximport)
+library(ggrepel)
+library(EnsDb.Hsapiens.v86)
+library(factoextra)
+library(dplyr)
+library(CorLevelPlot)
+library(ggrepel)
+library(viridis)
+
+##### Set working directory and load data --------------------------------------------
+getwd()
+setwd("[Working directory]")
+dir <- "[Working directory]"
+
+# List all directories containing data
+
+samples <- read.table(file.path(dir, "basic_samples.txt"), header = T) # This is a list of the 38 BASIC samples
+
+# Obtain a vector for all path names 
+
+files <- file.path(dir, samples$sample_id, "quant.sf")
+
+# Names for each element
+
+names(files) <- paste0(c("BAS.1693.TP2", "BAS.1701.TP1", "BAS.1693.TP1", "BAS.1806.TP2", "BAS.1847.TP2", "BAS.1817.TP2", "BAS.1789.TP2", "BAS.1818.TP1", "BAS.1789.TP1", "BAS.2021.TP2", "BAS.1833.TP1", "BAS.1818.TP2", "BAS.1724.TP2", "BAS.1716.TP2", "BAS.1840.TP1", "BAS.1884.TP2", "BAS.1716.TP1", "BAS.1847.TP1", "BAS.2022.TP2", "BAS.1746.TP2", "BAS.1849.TP1", "BAS.1806.TP1", "BAS.1746.TP1", "BAS.1929.TP2", "BAS.2021.TP1", "BAS.1911.TP1", "BAS.1929.TP1", "BAS.1884.TP1", "BAS.2022.TP1", "BAS.1724.TP1", "BAS.1840.TP2", "BAS.1817.TP1", "BAS.1701.TP2", "BAS.1833.TP2", "BAS.2064.TP1", "BAS.1849.TP2", "BAS.1911.TP2", "BAS.2064.TP2"))
+
+file.exists(files)
+
+
+
+## Building transcript / gene table with Ensembl human index ----------------
+
+
+edb <- EnsDb.Hsapiens.v86
+edb
+
+
+k <- keys(edb, keytype = "TXNAME")
+tx2gene <- transcripts(edb, columns = c("tx_id", "gene_id"))
+tx2gene <- data.frame(
+  TXNAME = mcols(tx2gene)$tx_id,  # Extract tx_id from metadata
+  GENEID = mcols(tx2gene)$gene_id  # Extract gene_id from metadata
+)
+head(tx2gene)
+
+
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene, countsFromAbundance="lengthScaledTPM", ignoreTxVersion = TRUE) # Note that this ignores the transcript, and uses lengthscaledTPM, i.e. it accounts for bias in the length of transcripts
+
+# Save counts as data
+
+basic_rnaseq_data <- txi$counts %>%
+  round() %>%
+  data.frame()
+
+
+## Annotations
+
+annot <- as.data.frame(genes(edb))
+annot <- subset(annot, select = c("gene_id", "gene_name"))
+
+
+### Create meta data --------------------------------------------------------
+
+sampleTable <- data.frame(timepoint = substr(colnames(basic_rnaseq_data), 10,12))
+
+meta <- data.frame(sampleTable, row.names = colnames(txi$counts))
+
+# Add each patientt as their own control
+meta$patientid <- rownames(meta)
+meta$patientid <- gsub("\\.TP[12]", "", meta$patientid) %>%
+  factor()
+
+meta$timepoint <- factor(meta$timepoint)
+
+
+patient <- as.data.frame(substr(row.names(meta),1,8))
+names(patient)[names(patient) =="substr(row.names(meta), 1, 8)"] <- "basic_id"
+patient_data_link <- as.data.frame(cbind(patient$basic_id, meta$timepoint))
+names(patient_data_link)[names(patient_data_link) =="V1"] <- "basic_id"
+names(patient_data_link)[names(patient_data_link) =="V2"] <- "timepoint"
+patient_data_link$timepoint <- as.factor(patient_data_link$timepoint)
+
+### DESeq2 -----------------------------------------------------------------
+
+# Match metadata and counts data - check if match
+
+all(colnames(txi$counts) %in% rownames(meta))
+all(colnames(txi$counts) == rownames(meta))
+
+# Create DESeq2Dataset object
+
+ddsTxi <- DESeqDataSetFromTximport(txi, colData = meta, design = ~ patientid +timepoint)
+
+# Keep only rows with more than 10 reads
+
+keep <- rowSums(counts(ddsTxi)) >= 10
+dds <- ddsTxi[keep,]
+
+# Run DESeq2
+
+dds <- DESeq(dds)
+
+### Normalization ------------------------------------------------------------
+
+
+# Retrieve normalized counts matrix
+
+normalized_counts <- counts(dds, normalized=TRUE)
+
+# Save to a file for later use
+
+write.table(normalized_counts, file = "basic_quant/normalized_count.txt", sep = "\t", quote = F, col.names = NA)
+
+# Normalize + Transform counts for PCA data visualization
+
+vsd <- vst(dds, blind = TRUE)
+assay_vsd <- assay(vsd)
+
+# Normalize counts for DGE analysis 
+
+# Convert normalized_counts to a dataframe and transfer the row names to a new column
+
+normalized_counts_df <- counts(dds, normalized=T) %>%
+  data.frame() %>%
+  rownames_to_column(var="gene")
+
+# Merge together (ensembl IDs) the normalized counts data frame w a subset of 
+# the annotations in the tx2gene data frame (only the columns for ensembl gene IDs
+# and gene symbols)
+
+normalized_counts_df <- merge(normalized_counts_df, annot, by.x="gene", by.y = "gene_id")
+
+# Create a tibble for normalized counts
+
+normalized_counts_df <- normalized_counts_df %>%
+  as_tibble()
+
+### Plot PCA ----------------------------------------------------------------
+
+
+# PCA PLOT WITH ARROWS
+
+xpca_data <- plotPCA(vsd, intgroup = "timepoint", returnData = TRUE)
+percentVar <- round(100* attr(xpca_data, "percentVar"))
+xpca_data <- cbind(xpca_data, samples$basic_id)
+xpca_data <- xpca_data %>% select(-name, -group)
+names(xpca_data)[names(xpca_data) =="samples$basic_id"] <- "basic_id"
+
+xt1_data <- xpca_data %>% filter(timepoint == "TP1")
+xt2_data <- xpca_data %>% filter(timepoint == "TP2")
+xarrows_df <- left_join(xt1_data, xt2_data, by = "basic_id", suffix = c("_time1", "_time2"))
+
+
+
+## By Timepoint
+
+xp <- ggplot(xpca_data, aes(x = PC1, y = PC2, color = timepoint)) +
+  geom_point(size = 4) +
+  labs(title = "PCA by Timepoint", x = "PC1: 16% variance", y = "PC2: 13% variance") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  scale_color_viridis_d(begin = 0.1, end = 0.85)
+
+xp1 <- xp + geom_segment(data = xarrows_df, 
+                         aes(x = PC1_time1, xend = PC1_time2, 
+                             y = PC2_time1, yend = PC2_time2), 
+                         colour = "black",
+                         arrow = arrow(type = "closed", length = unit(2, "mm")),
+                         linewidth = 0.5) +
+  theme(legend.position = "top")
+
+
+ggsave("/Users/shani/Documents/Y3 project/SS figures/PCA_allgenes.png", plot = xp1, bg = "white", width = 8, height = 8, dpi = 600)
+
+
+
+## By patient
+
+xp2 <- ggplot(xpca_data, aes(x = PC1, y = PC2, color = basic_id)) +
+  geom_point(size = 3) +
+  labs(title = "PCA by Patient", x = "PC1: 16% variance", y = "PC2: 13% variance") +
+  theme_minimal()
+
+xp2 + geom_segment(data = xarrows_df, 
+                   aes(x = PC1_time1, xend = PC1_time2, 
+                       y = PC2_time1, yend = PC2_time2), 
+                   colour = "black",
+                   arrow = arrow(type = "closed", length = unit(2, "mm")),
+                   linewidth = 0.5) +
+  theme(legend.position = "top")
+
+
+
+#### Results -----------------------------------------------------------
+
+# Define contrasts for TP1 vs TP2
+
+contrast_oe <- c("timepoint", "TP2", "TP1")
+
+# Extract results for TP2 vs TP1
+
+res_tableTP <- results(dds, contrast=contrast_oe, alpha=0.05)
+
+# Check class
+
+class(res_tableTP)
+
+# What is stored in the result
+
+res_tableTP %>%
+  data.frame() 
+
+# Summarize results
+
+summary(res_tableTP, alpha = 0.05)
+
+# out of 20161 with nonzero total read count
+# adjusted p-value < 0.05
+# LFC > 0 (up)       : 1186, 5.9%
+# LFC < 0 (down)     : 1638, 8.1%
+# outliers [1]       : 0, 0%
+# low counts [2]     : 4691, 23%
+
+## Extract significant differentially expressed genes 
+
+# Set thresholds
+
+padj.cutoff <- 0.05
+
+# Create a tibble of results
+
+res_tableTP_tb <- res_tableTP %>%
+  data.frame() %>%
+  rownames_to_column(var = "gene") %>%
+  as_tibble()
+
+# Add gene names
+
+res_tableTP_tb <- merge(res_tableTP_tb, annot, by.x="gene", by.y = "gene_id")
+
+# Subset the tibble to keep only significant genes
+
+sigTP <- res_tableTP_tb %>%
+  dplyr::filter(padj < padj.cutoff & abs(log2FoldChange) >= 0.5) 
+
+
+#### PCA for DEGs  -----------------------------------------------------------
+
+# Subset sig DEGs
+
+vsd_sig <- vsd[sigTP$gene, ]  
+
+xpca_sig <- plotPCA(vsd_sig, intgroup = "timepoint", returnData = TRUE)
+percentVar_sig <- round(100 * attr(xpca_sig, "percentVar"))
+
+xpca_sig <- cbind(xpca_sig, basic_id = samples$basic_id) %>%
+  select(-name, -group) 
+
+t1_sig <- xpca_sig %>% filter(timepoint == "TP1")
+t2_sig <- xpca_sig %>% filter(timepoint == "TP2")
+
+arrows_sig <- left_join(t1_sig, t2_sig, by = "basic_id", suffix = c("_time1", "_time2"))
+
+
+# By timepoint
+
+p_sig <- ggplot(xpca_sig, aes(PC1, PC2, color = timepoint)) +
+  geom_point(size = 3) +
+  geom_segment(
+    data = arrows_sig,
+    aes(x = PC1_time1, y = PC2_time1, xend = PC1_time2, yend = PC2_time2),
+    inherit.aes = FALSE,
+    colour = "black",
+    arrow = arrow(type = "closed", length = unit(2, "mm")),
+    linewidth = 0.5
+  ) +
+  labs(
+    title = "PCA by Timepoint (Differentially expressed genes)",
+    x = paste0("PC1: ", percentVar_sig[1], "% variance"),
+    y = paste0("PC2: ", percentVar_sig[2], "% variance"),
+    color = "Timepoint"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  scale_color_viridis_d(begin = 0.1, end = 0.85)
+
+p_sig
+
+ggsave("/Users/shani/Documents/Y3 project/SS figures/PCA_DEGs2.png", plot = p_sig, bg = "white", width = 8, height = 8, dpi = 600)
+
+
+# By patient
+
+p_sig_2 <- ggplot(xpca_sig, aes(PC1, PC2, color = basic_id)) +
+  geom_point(size = 3) +
+  geom_segment(
+    data = arrows_sig,
+    aes(x = PC1_time1, y = PC2_time1, xend = PC1_time2, yend = PC2_time2),
+    inherit.aes = FALSE,
+    colour = "black",
+    arrow = arrow(type = "closed", length = unit(2, "mm")),
+    linewidth = 0.3
+  ) +
+  labs(
+    title = "PCA of Differentially expressed genes between timepoints only",
+    x = paste0("PC1: ", percentVar_sig[1], "% variance"),
+    y = paste0("PC2: ", percentVar_sig[2], "% variance"),
+    color = "Patient ID"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+p_sig_2
+
+
+## MA plot ----------------------------------------------------------------
+
+# MA plot using unshrunken fold changes
+
+plotMA(res_tableTP, ylim=c(-2,2), main = "MA plot using unshrunken fold changes")
+library("apeglm")
+res_shrunken <- lfcShrink(dds, coef="timepoint_TP2_vs_TP1", type="apeglm")
+plotMA(res_shrunken, ylim=c(-2,2), main = "MA plot using shrunken fold changes")
+
+
+
+#### Volcano plot - adapted from https://biostatsquid.com/volcano-plots-r-tutorial/ ------------------
+
+# Obtain logical vector where TRUE values denote padj values>0.05 
+# and fold change>1.5 in either direction
+
+res_tableTP_tb <- res_tableTP_tb %>%
+  dplyr::mutate(threshold_OE = padj < 0.05 & abs(log2FoldChange) >= 0.5)
+
+# Add a column to specify if UP or DOWN regulated
+
+res_tableTP_tb$diffexpressed <- "NO"
+res_tableTP_tb$diffexpressed[res_tableTP_tb$log2FoldChange > 0.5 & res_tableTP_tb$padj < 0.05] <- "UP"
+res_tableTP_tb$diffexpressed[res_tableTP_tb$log2FoldChange < -0.5 & res_tableTP_tb$padj < 0.05] <- "DOWN"
+
+
+# Plot
+
+
+# Label top significant genes
+
+# Create a new column "delabel" to de, that will contain the name of the top 20 differential expressed genes (NA in case they are not)
+
+res_tableTP_tb$delabel <- ifelse(res_tableTP_tb$gene_name %in% head(res_tableTP_tb[order(res_tableTP_tb$padj), "gene_name"], 20) | abs(res_tableTP_tb$log2FoldChange) > 6, res_tableTP_tb$gene_name, NA)
+
+
+volcanoplot <- ggplot(data = res_tableTP_tb, aes(x = log2FoldChange, y = -log10(padj), col = diffexpressed, label = delabel)) +
+  geom_vline(xintercept = c(-0.5, 0.5), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') + 
+  geom_point(size = 2) +
+  xlim(-4,4) +
+  scale_color_manual(values = c("#00AFBB", "grey", "red"), 
+                     labels = c("Downregulated", "Not significant", "Upregulated")) +
+  labs(color = ' ', #legend_title, 
+       x = expression("log"[2]*"FoldChange"), y = expression("-log"[10]*"p-value")) + 
+  theme(axis.text.x = element_text(size = 12), axis.title.x = element_text(size = 16), axis.title.y = element_text(size = 16), axis.text.y = element_text(size = 12)) +
+  theme(
+    legend.text = element_text(size = 13)  # <- Increase legend label size
+  )+
+  #ggtitle('Volcano plot') + # Plot title 
+  geom_text_repel(max.overlaps = Inf, size = 6) + # To show all labels +
+  theme(legend.position = "top") +
+  theme_minimal()
+
+volcanoplot
+
+ggsave("/Users/shani/Documents/Y3 project/SS figures/DEG.png", plot = volcanoplot, width = 12, height = 8, dpi = 600)
+
+### Plot top 20 DE genes by padj values -------------------------------------
+
+library(ggsignif)
+
+# Order results by padj values
+
+top20_sig_genes <- res_tableTP_tb %>%
+  arrange(padj) %>%
+  pull(gene) %>%
+  head(n=20)
+
+# Normalized counts for top 20 significant genes
+
+top20_sig_norm <- normalized_counts_df %>%
+  dplyr::filter(gene %in% top20_sig_genes)
+
+# Gathering the columns to have normalized counts to a single column for ggplot
+
+gathered_top20_sig <- top20_sig_norm %>%
+  gather(colnames(top20_sig_norm)[2:39], key = "patient", value = "normalized_counts")
+
+# Combine metadata info w normalized counts data for input to ggplot so that our
+# counts can be colored by sample group
+
+gathered_top20_sig <- left_join(TP_meta, gathered_top20_sig)
+
+
+# Plot using ggplot2
+
+ggplot(gathered_top20_sig) +
+  geom_point(aes(x=gene_name, y=normalized_counts, color=timepoint)) +
+  scale_y_log10() +
+  xlab("Genes") +
+  ylab("log10 Normalized Counts") + 
+  ggtitle("Top 20 Significant DE Genes by padj") +
+  theme_bw() +
+  theme(axis.text = element_text(angle = 45, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Boxplot
+library(ggpubr)
+
+boxplot <- ggplot(gathered_top20_sig, aes(x = gene_name, y = normalized_counts, color=timepoint)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  theme_bw() +
+  labs(x = "", y = expression("log"[10]*" normalized counts")) +
+  theme(axis.text = element_text(angle = 45, hjust = 1, size = 15)) 
+#stat_compare_means(aes(group = timepoint), label = "p.signif")
+
+boxplot
+
+
+
+### Plot top 20 DE genes by log2F values --------------------------------------
+
+# Order results by log2FC values
+
+top20_sig_genes_log2FC <- sigTP %>%
+  arrange(abs(log2FoldChange)) %>%
+  pull(gene) %>%
+  head(n=20)
+
+# Normalized counts for top 20 significant genes - 
+
+top20_sig_norm_log2FC <- normalized_counts_df %>%
+  dplyr::filter(gene %in% top20_sig_genes_log2FC)
+
+# Gathering the columns to have normalized counts to a single column for ggplot
+
+gathered_top20_sig_log2FC <- top20_sig_norm_log2FC %>%
+  gather(colnames(top20_sig_norm_log2FC)[2:39], key = "patient", value = "normalized_counts")
+
+# Combine metadata info w normalized counts data for input to ggplot so that our
+# counts can be colored by sample group
+
+gathered_top20_sig_log2FC <- left_join(TP_meta, gathered_top20_sig_log2FC)
+
+
+# Plot using ggplot2
+
+ggplot(gathered_top20_sig_log2FC) +
+  geom_point(aes(x=gene_name, y=normalized_counts, color=timepoint)) +
+  scale_y_log10() +
+  xlab("Genes") +
+  ylab("log10 Normalized Counts") + 
+  ggtitle("Top 20 Significant DE Genes by log2FC") +
+  theme_bw() +
+  theme(axis.text = element_text(angle = 45, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Boxplot
+
+ggplot(gathered_top20_sig_log2FC, aes(x = gene_name, y = (normalized_counts), color=timepoint)) +
+  scale_y_log10() +
+  geom_boxplot() +
+  theme_bw() +
+  labs(title = "Top 20 Significant DE Genes by log2FC", x = "Gene", y = "log10 Normalized Counts") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))   # Rotate x-axis labels for better readability
+
